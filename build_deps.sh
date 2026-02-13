@@ -2,8 +2,6 @@
 set -euo pipefail
 
 PREFIX="${PREFIX:-$HOME/musl}"
-export CC="${CC:-$PREFIX/bin/musl-gcc -static}"
-export CFLAGS="${CFLAGS:--fPIC -DOPENSSL_NO_SECURE_MEMORY}"
 BUILD_DIR=$(mktemp -d)
 NPROC=$(nproc 2>/dev/null || echo 4)
 
@@ -13,12 +11,36 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[*] Building in $BUILD_DIR"
-echo "[*] Using CC=$CC"
 echo "[*] Prefix: $PREFIX"
 
 mkdir -p "$PREFIX"
 
 cd "$BUILD_DIR"
+
+# Build musl (using system gcc)
+if [ ! -f "$PREFIX/bin/musl-gcc" ]; then
+    echo "[+] Building musl..."
+    curl -L -f --retry 3 -O https://musl.libc.org/releases/musl-1.2.4.tar.gz || {
+        echo "[-] Failed to download musl"
+        exit 1
+    }
+    tar xzf musl-1.2.4.tar.gz
+    cd musl-1.2.4
+    # Ensure we use system gcc for this step
+    CC=gcc ./configure --prefix="$PREFIX" --syslibdir="$PREFIX/lib" --disable-shared
+    make -j"$NPROC"
+    make install
+    cd ..
+    echo "[+] musl built successfully"
+else
+    echo "[*] musl already built, skipping"
+fi
+
+# Set compiler to musl-gcc for subsequent builds
+export CC="${PREFIX}/bin/musl-gcc"
+export CFLAGS="${CFLAGS:--static -fPIC -DOPENSSL_NO_SECURE_MEMORY}"
+
+echo "[*] Switched CC to $CC"
 
 # Build OpenSSL
 if [ ! -f "$PREFIX/lib/libssl.a" ]; then
@@ -48,11 +70,13 @@ if [ ! -f "$PREFIX/lib/libcurl.a" ]; then
     }
     tar xzf curl-8.5.0.tar.gz
     cd curl-8.5.0
+    # curl configure needs help finding the static openssl in prefix
     ./configure --prefix="$PREFIX" --disable-shared --enable-static \
                 --with-openssl="$PREFIX" --disable-ldap --disable-ldaps \
                 --disable-rtsp --disable-dict --disable-telnet --disable-tftp \
                 --disable-pop3 --disable-imap --disable-smtp --disable-gopher \
-                --disable-manual --disable-libcurl-option --without-zlib
+                --disable-manual --disable-libcurl-option --without-zlib \
+                CC="$CC" CFLAGS="$CFLAGS" LIBS="-ldl -lpthread"
     make -j"$NPROC"
     make install
     cd ..

